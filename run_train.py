@@ -1,6 +1,7 @@
 import datetime
 import os
 import os.path
+import platform
 import gc
 from itertools import chain
 
@@ -31,24 +32,30 @@ def setup(rank, world_size, port):
 
     # initialize the process group
     dist.init_process_group(
-        "nccl", rank=rank, world_size=world_size, timeout=datetime.timedelta(minutes=30)
+        "nccl" if torch.cuda.is_available() and platform.system() != "Windows" else "gloo",
+        rank=rank, world_size=world_size, timeout=datetime.timedelta(minutes=30)
     )
 
 
 def cleanup():
-    dist.destroy_process_group()
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def run_multiprocess(rank, world_size, cfg, port):
+    distributed = world_size > 1
     try:
-        setup(rank, world_size, port)
-        _run(rank, world_size, cfg)
+        if distributed:
+            setup(rank, world_size, port)
+        _run(rank, world_size, cfg, distributed=distributed)
     finally:
-        cleanup()
+        if distributed:
+            cleanup()
 
 
-def _run(rank, world_size, cfg):
-    torch.cuda.set_device(rank)
+def _run(rank, world_size, cfg, distributed=True):
+    if torch.cuda.is_available():
+        torch.cuda.set_device(rank)
     work_dir = cfg.work_dir
 
     # Create directories for experimental logs
@@ -88,7 +95,9 @@ def _run(rank, world_size, cfg):
     
     # build score model
     score_model = SEDD(cfg).to(device)
-    score_model = DDP(score_model, device_ids=[rank], static_graph=True, find_unused_parameters=True)
+    ddp_device_ids = [rank] if device.type == "cuda" else None
+    if distributed:
+        score_model = DDP(score_model, device_ids=ddp_device_ids, static_graph=True, find_unused_parameters=True)
 
     num_parameters = sum(p.numel() for p in score_model.parameters())
     mprint(f"Number of parameters in the model: {num_parameters}")
@@ -100,14 +109,15 @@ def _run(rank, world_size, cfg):
 
     # build noise
     noise = noise_lib.get_noise(cfg).to(device)
-    noise = DDP(noise, device_ids=[rank], static_graph=True)
+    if distributed:
+        noise = DDP(noise, device_ids=ddp_device_ids, static_graph=True)
     sampling_eps = 1e-5
 
 
     # build optimization state
     optimizer = losses.get_optimizer(cfg, chain(score_model.parameters(), noise.parameters()))
     mprint(f"Optimizer: {optimizer}")
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
     mprint(f"Scaler: {scaler}")
     state = dict(optimizer=optimizer, scaler=scaler, model=score_model, noise=noise, ema=ema, step=0) 
 
@@ -121,7 +131,7 @@ def _run(rank, world_size, cfg):
     tokenizer = GPT2TokenizerFast.from_pretrained('gpt2')
 
     # Build data iterators
-    train_ds, eval_ds = data.get_dataloaders(cfg)
+    train_ds, eval_ds = data.get_dataloaders(cfg, distributed=distributed)
 
     # mprint(f"Length of datasets: {len(train_ds)}, {len(eval_ds)}")
 
@@ -154,39 +164,42 @@ def _run(rank, world_size, cfg):
 
         # flag to see if there was movement ie a full batch got computed
         if step != state['step']:
-            if step % cfg.training.log_freq == 0:
-                dist.all_reduce(loss)
-                loss /= world_size
+            completed_step = state['step']
+            if completed_step % cfg.training.log_freq == 0:
+                if distributed:
+                    dist.all_reduce(loss)
+                    loss /= world_size
 
-                mprint("step: %d, training_loss: %.5e" % (step, loss.item()))
+                mprint("step: %d, training_loss: %.5e" % (completed_step, loss.item()))
             
-            if step % cfg.training.snapshot_freq_for_preemption == 0 and rank == 0:
+            if completed_step % cfg.training.snapshot_freq_for_preemption == 0 and rank == 0:
                 utils.save_checkpoint(checkpoint_meta_dir, state)
 
-            if step % cfg.training.eval_freq == 0:
+            if completed_step % cfg.training.eval_freq == 0:
                 if cfg.data.valid != "text8":
                     eval_batch = next(eval_iter)['input_ids'].to(device)
                 else:
                     eval_batch = next(train_iter).to(device)
                 eval_loss = eval_step_fn(state, eval_batch)
 
-                dist.all_reduce(eval_loss)
-                eval_loss /= world_size
+                if distributed:
+                    dist.all_reduce(eval_loss)
+                    eval_loss /= world_size
 
-                mprint("step: %d, evaluation_loss: %.5e" % (step, eval_loss.item()))
+                mprint("step: %d, evaluation_loss: %.5e" % (completed_step, eval_loss.item()))
 
-            if step > 0 and step % cfg.training.snapshot_freq == 0 or step == num_train_steps:
+            if (completed_step > 0 and completed_step % cfg.training.snapshot_freq == 0) or completed_step == num_train_steps:
                 # Save the checkpoint.
-                save_step = step // cfg.training.snapshot_freq
+                save_step = completed_step // cfg.training.snapshot_freq
                 if rank == 0:
                     utils.save_checkpoint(os.path.join(
                         checkpoint_dir, f'checkpoint_{save_step}.pth'), state)
 
                 # Generate and save samples
                 if cfg.training.snapshot_sampling:
-                    mprint(f"Generating text at step: {step}")
+                    mprint(f"Generating text at step: {completed_step}")
 
-                    this_sample_dir = os.path.join(sample_dir, "iter_{}".format(step))
+                    this_sample_dir = os.path.join(sample_dir, "iter_{}".format(completed_step))
                     utils.makedirs(this_sample_dir)
 
                     ema.store(score_model.parameters())
@@ -214,10 +227,12 @@ def _run(rank, world_size, cfg):
                                 perplexity = F.cross_entropy(logits[..., :-1], s[..., 1:], reduction="none").mean(dim=-1).exp().mean()
                                 total_perplexity += perplexity
                             total_perplexity /= batches
-                            dist.all_reduce(total_perplexity)
-                            total_perplexity /= world_size
-                            mprint(f"Generative Perplexity at step: {step}. Perplexity: {total_perplexity:.3f}.")
+                            if distributed:
+                                dist.all_reduce(total_perplexity)
+                                total_perplexity /= world_size
+                            mprint(f"Generative Perplexity at step: {completed_step}. Perplexity: {total_perplexity:.3f}.")
 
                             del eval_model, logits, loss
 
-                    dist.barrier()
+                    if distributed:
+                        dist.barrier()

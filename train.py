@@ -1,7 +1,7 @@
 """Training and evaluation"""
 
-import hydra
 import os
+import hydra
 import numpy as np
 import run_train
 import utils
@@ -41,8 +41,14 @@ def main(cfg):
         logger.info(f"Run id: {hydra_cfg.job.id}")
 
     try:
-        mp.set_start_method("forkserver")
-        mp.spawn(run_train.run_multiprocess, args=(ngpus, cfg, port), nprocs=ngpus, join=True)
+        # Windows only supports spawn; force=True also makes notebook/IDE reruns safe.
+        mp.set_start_method("spawn", force=True)
+        if ngpus == 1:
+            # A single GPU does not need DDP or a spawned child process. This is
+            # also the reliable path on Windows, whose PyTorch build has no NCCL.
+            run_train.run_multiprocess(0, ngpus, cfg, port)
+        else:
+            mp.spawn(run_train.run_multiprocess, args=(ngpus, cfg, port), nprocs=ngpus, join=True)
     except Exception as e:
         logger.critical(e, exc_info=True)
 

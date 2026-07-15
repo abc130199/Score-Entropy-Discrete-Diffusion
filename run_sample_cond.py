@@ -14,6 +14,7 @@ def main():
     parser.add_argument("--steps", type=int, default=1024)
     parser.add_argument("--prefix", type=str, default="Hi, my name is")
     parser.add_argument("--suffix", type=str, default=" and that's why I'm late.")
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     args = parser.parse_args()
 
     tokenizer = GPT2TokenizerFast.from_pretrained('gpt2')
@@ -28,13 +29,14 @@ def main():
     # input_locs = [5, 6, 19, 20, 1000, 10001]
 
 
-    input_ids = torch.tensor(input_ids, device="cuda")[None].repeat(args.batch_size, 1)
+    device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available() else
+                          "cpu" if args.device == "auto" else args.device)
+    input_ids = torch.tensor(input_ids, device=device)[None].repeat(args.batch_size, 1)
 
     def proj_fun(x):
         x[:, input_locs] = input_ids
         return x
     
-    device = torch.device('cuda')
     model, graph, noise = load_model(args.model_path, device)
     
 

@@ -25,6 +25,20 @@ conda env create -f environment.yml
 
 which will create a ```sedd``` environment with packages installed. Note that this installs with CUDA 11.8, and different CUDA versions must be installed manually. The biggest factor is making sure that the ```torch``` and ```flash-attn``` packages use the same CUDA version (more found [here](https://github.com/Dao-AILab/flash-attention)).
 
+### Windows
+
+On Windows, create the portable environment instead (NVIDIA GPU/CUDA 12.8):
+
+```
+conda env create -f environment-windows.yml
+conda activate sedd
+```
+
+`flash-attn` has no native Windows wheel, so the code automatically falls back to
+PyTorch scaled-dot-product attention. Sampling selects CUDA when available and CPU
+otherwise; it can also be forced with `--device cpu` or `--device cuda`. CPU sampling
+of the pretrained models is supported but is expected to be very slow.
+
 ## Working with Pretrained Models
 
 ### Download Models
@@ -94,6 +108,49 @@ python train.py noise_lib=loglinear graph.type=absorb model=medium training.accu
 # training hyperparameters for SEDD uniform
 python train.py noise_lib=geometric graph.type=uniform model=small model.scale_by_sigma=False
 ```
+
+### Training with the s1K reasoning dataset
+
+The loader supports both `s1k` (`simplescaling/s1K`) and the recommended newer
+`s1k-1.1` (`simplescaling/s1K-1.1`). The latter contains the same curated set of
+1,000 reasoning questions with newer R1/DeepSeek reasoning traces. It is downloaded
+and cached under `data/` automatically.
+
+```
+python train.py data.train=s1k-1.1
+```
+
+The Windows config uses an effective batch size of 32 with 8 accumulation steps
+(micro-batch 4) and disables memory-heavy snapshot sampling/perplexity evaluation.
+If memory is still tight, use `training.batch_size=16 training.accum=8
+eval.batch_size=16`, which lowers the micro-batch to 2.
+
+Each structured record is converted to `Question / Reasoning / Answer` text before
+GPT-2 tokenization. Since SEDD is an unconditional diffusion language model, this
+trains on the complete sequence rather than applying supervised fine-tuning loss
+only to the answer. Keep `data.valid=wikitext103`: both s1K variants contain only a
+training split.
+
+### Supervised fine-tuning from pretrained SEDD
+
+Use the separate conditional SFT entry point to load `louaaron/sedd-small`, keep
+Question tokens clean, and apply forward diffusion plus Score Entropy loss only
+to Reasoning/Answer tokens:
+
+```
+python finetune_s1.py --dataset s1k-1.1 --steps 10000
+```
+
+The script makes a deterministic 800/100/100 train/validation/test split. It
+writes `checkpoint.pt`, a Hugging Face-compatible final model, `splits.json`, and
+test metrics under `exp_local/s1k-1.1-sft`. Resume with:
+
+```
+python finetune_s1.py --resume exp_local/s1k-1.1-sft/checkpoint.pt
+```
+
+To conditionally sample held-out questions after training and compute a simple
+normalized exact-match diagnostic, add `--sample-count 10 --sample-steps 128`.
 
 ## Other Features
 

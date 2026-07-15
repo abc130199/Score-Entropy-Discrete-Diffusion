@@ -13,10 +13,12 @@ def main():
     parser.add_argument("--dataset", default="wikitext103", type=str)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--steps", type=int, default=1024)
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     args = parser.parse_args()
 
     
-    device = torch.device('cuda')
+    device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available() else
+                          "cpu" if args.device == "auto" else args.device)
     model, graph, noise = load_model(args.model_path, device)
     tokenizer = GPT2TokenizerFast.from_pretrained('gpt2')
 
