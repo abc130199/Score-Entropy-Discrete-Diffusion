@@ -35,18 +35,21 @@ def rotate_half(x):
     )
 
 
-@torch.jit.script
-def _apply_rotary_pos_emb_torchscript(qkv, cos, sin):
+def _apply_rotary_pos_emb_native(qkv, cos, sin):
+    """Portable PyTorch fallback used when flash-attn is unavailable."""
     return (qkv * cos) + (rotate_half(qkv) * sin)
 
 
 def apply_rotary_pos_emb(qkv, cos, sin):
     try:
         import flash_attn.layers.rotary
+    except (ImportError, OSError):
+        # TorchScript's dynamic slicing is unreliable in the Windows build;
+        # eager PyTorch is fast enough here and works for both train and eval.
+        return _apply_rotary_pos_emb_native(qkv, cos, sin)
+    else:
         cos = cos[0,:,0,0,:cos.shape[-1]//2]
         sin = sin[0,:,0,0,:sin.shape[-1]//2]
         return flash_attn.layers.rotary.apply_rotary_emb_qkv_(
             qkv, cos, sin
         )
-    except:
-        return _apply_rotary_pos_emb_torchscript(qkv, cos, sin)

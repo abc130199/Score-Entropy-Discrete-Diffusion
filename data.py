@@ -117,7 +117,13 @@ def get_lambada_test_dataset():
 
 
 def get_dataset(name, mode, cache_dir=None, block_size=1024, num_proc=8):
-    if name == "wikitext103":
+    s1_datasets = {
+        "s1k": "simplescaling/s1K",
+        "s1k-1.1": "simplescaling/s1K-1.1",
+    }
+    if name in s1_datasets:
+        dataset = load_dataset(s1_datasets[name], cache_dir=cache_dir)
+    elif name == "wikitext103":
         dataset = load_dataset("wikitext", name="wikitext-103-raw-v1", cache_dir=cache_dir)
     elif name == "wikitext2":
         dataset = load_dataset("wikitext", name="wikitext-2-raw-v1", cache_dir=cache_dir)
@@ -131,7 +137,31 @@ def get_dataset(name, mode, cache_dir=None, block_size=1024, num_proc=8):
     if name == "lambada":
         data = dataset
     else:
+        if mode not in dataset:
+            available = ", ".join(dataset.keys())
+            raise ValueError(f"Dataset {name!r} has no {mode!r} split (available: {available}).")
         data = dataset[mode]
+
+    if name in s1_datasets:
+        def format_s1(example):
+            if name == "s1k-1.1":
+                reasoning = example.get("deepseek_thinking_trajectory") or ""
+                answer = example.get("deepseek_attempt") or example.get("solution") or ""
+            else:
+                trajectories = example.get("thinking_trajectories") or []
+                reasoning = trajectories[0] if trajectories else ""
+                answer = example.get("attempt") or example.get("solution") or ""
+            return {
+                "text": (
+                    f"Question:\n{example['question']}\n\n"
+                    f"Reasoning:\n{reasoning}\n\n"
+                    f"Answer:\n{answer}"
+                )
+            }
+
+        # Convert the structured reasoning records into the plain-text corpus
+        # expected by this unconditional GPT-2-tokenized diffusion model.
+        data = data.map(format_s1, remove_columns=data.column_names, num_proc=num_proc)
 
     if name.startswith("wikitext"):
         detokenizer = wt_detokenizer
@@ -200,14 +230,19 @@ def get_dataset(name, mode, cache_dir=None, block_size=1024, num_proc=8):
 
 
 def get_dataloaders(config, distributed=True):
+    num_workers = int(config.data.get("num_workers", 0))
+    preprocessing_num_workers = int(config.data.get("preprocessing_num_workers", 1))
     if config.training.batch_size % (config.ngpus * config.training.accum) != 0:
             raise ValueError(f"Train Batch Size {config.training.batch_size} is not divisible by {config.ngpus} gpus with accumulation {config.training.accum}.")
     if config.eval.batch_size % (config.ngpus * config.training.accum) != 0:
         raise ValueError(f"Eval Batch Size for {config.eval.batch_size} is not divisible by {config.ngpus} gpus with accumulation {config.training.accum}.")
 
 
-    train_set = get_dataset(config.data.train, "train", cache_dir=config.data.cache_dir, block_size=config.model.length)
-    valid_set = get_dataset(config.data.valid, "validation" if config.data.valid != "text8" else "test", cache_dir=config.data.cache_dir, block_size=config.model.length)
+    train_set = get_dataset(config.data.train, "train", cache_dir=config.data.cache_dir,
+                            block_size=config.model.length, num_proc=preprocessing_num_workers)
+    valid_set = get_dataset(config.data.valid, "validation" if config.data.valid != "text8" else "test",
+                            cache_dir=config.data.cache_dir, block_size=config.model.length,
+                            num_proc=preprocessing_num_workers)
 
     if distributed:
         train_sampler = DistributedSampler(train_set) 
@@ -221,17 +256,17 @@ def get_dataloaders(config, distributed=True):
         train_set,
         batch_size=config.training.batch_size // (config.ngpus * config.training.accum),
         sampler=train_sampler,
-        num_workers=4,
-        pin_memory=True,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
         shuffle=(train_sampler is None),
-        persistent_workers=True,
+        persistent_workers=num_workers > 0,
     ))
     valid_loader = cycle_loader(DataLoader(
         valid_set,
         batch_size=config.eval.batch_size // (config.ngpus * config.training.accum),
         sampler=test_sampler,
-        num_workers=4,
-        pin_memory=True,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
         shuffle=(test_sampler is None),
     ))
     return train_loader, valid_loader

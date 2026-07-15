@@ -5,7 +5,12 @@ import numpy as np
 import math
 
 from einops import rearrange
-from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func
+try:
+    from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func
+except (ImportError, OSError):
+    # flash-attn does not provide Windows/CPU wheels. PyTorch's native scaled
+    # dot-product attention is slower, but keeps inference and development usable.
+    flash_attn_varlen_qkvpacked_func = None
 # from flash_attn.ops.fused_dense import FusedMLP, FusedDense
 from huggingface_hub import PyTorchModelHubMixin
 from omegaconf import OmegaConf
@@ -169,18 +174,23 @@ class DDiTBlock(nn.Module):
             qkv = rotary.apply_rotary_pos_emb(
                 qkv, cos.to(qkv.dtype), sin.to(qkv.dtype)
             )
-        qkv = rearrange(qkv, 'b s ... -> (b s) ...')
-        if seqlens is None:
-            cu_seqlens = torch.arange(
-                0, (batch_size + 1) * seq_len, step=seq_len,
-                dtype=torch.int32, device=qkv.device
-            )
+        if flash_attn_varlen_qkvpacked_func is not None and qkv.is_cuda:
+            qkv = rearrange(qkv, 'b s ... -> (b s) ...')
+            if seqlens is None:
+                cu_seqlens = torch.arange(
+                    0, (batch_size + 1) * seq_len, step=seq_len,
+                    dtype=torch.int32, device=qkv.device
+                )
+            else:
+                cu_seqlens = seqlens.cumsum(-1)
+            x = flash_attn_varlen_qkvpacked_func(
+                qkv, cu_seqlens, seq_len, 0., causal=False)
+            x = rearrange(x, '(b s) h d -> b s (h d)', b=batch_size)
         else:
-            cu_seqlens = seqlens.cumsum(-1)
-        x = flash_attn_varlen_qkvpacked_func(
-            qkv, cu_seqlens, seq_len, 0., causal=False)
-        
-        x = rearrange(x, '(b s) h d -> b s (h d)', b=batch_size)
+            q, k, v = qkv.unbind(dim=2)
+            q, k, v = (t.transpose(1, 2) for t in (q, k, v))
+            x = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+            x = rearrange(x, 'b h s d -> b s (h d)')
 
         x = bias_dropout_scale_fn(self.attn_out(x), None, gate_msa, x_skip, self.dropout)
 
